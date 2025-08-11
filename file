@@ -1,0 +1,166 @@
+// Illegal-Logging-Detection-via-Satellite-and-ML (Synthetic Data)
+// Author: Amos Meremu Dogiye
+// GitHub: https://github.com/GTVSOFT
+//
+// Purpose: Demonstration of a detection workflow for logging disturbance
+// using synthetic imagery and >100 labeled points. Not for operational use.
+
+// ---------------- User settings ----------------
+var NUM_POINTS = 300;        // >100 points as requested
+var RANDOM_SEED = 2025;      // reproducible randomness
+var TRAIN_RATIO = 0.7;       // fraction for training
+var RF_TREES = 200;
+var EXPORT_SCALE = 30;       // meters (synthetic scale)
+var AOI = ee.Geometry.Rectangle([34.8, -1.5, 35.2, -1.1]); // example tropical bbox
+Map.centerObject(AOI, 11);
+
+// ---------------- Create synthetic raster layers ----------------
+// Base random noise bands (simulate spectral bands)
+var b1 = ee.Image.random(RANDOM_SEED).rename('band1');           // e.g. red-ish
+var b2 = ee.Image.random(RANDOM_SEED + 1).rename('band2');       // e.g. nir-ish
+var b3 = ee.Image.random(RANDOM_SEED + 2).rename('band3');       // shortwave, etc.
+var base = b1.addBands(b2).addBands(b3).clip(AOI);
+
+// Create an NDVI-like index: (b2 - b1) / (b2 + b1) scaled into 0..1
+var ndvi = b2.subtract(b1).divide(b2.add(b1).add(1e-6)).rename('ndvi')
+           .multiply(0.5).add(0.5); // normalize roughly 0..1
+
+// Simulate forest canopy texture (finer spatial structure)
+var texture = base.select('band3').focal_median(50, 'meters').rename('texture');
+
+// Create a synthetic "logging probability" surface by combining features
+// Intuition: logged areas -> lower ndvi, higher texture variance, chance events
+var loggingProb = ndvi.multiply(-1) // lower ndvi => higher logging prob
+  .add(texture.multiply(0.3))
+  .add(ee.Image.random(RANDOM_SEED + 10).multiply(0.5))
+  .rename('loggingProb')
+  .resample('bilinear')
+  .clip(AOI);
+
+// Normalize loggingProb to 0..1
+var minMax = loggingProb.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: AOI,
+  scale: EXPORT_SCALE,
+  maxPixels: 1e9
+});
+loggingProb = loggingProb.unitScale(ee.Number(minMax.get('loggingProb_min')), ee.Number(minMax.get('loggingProb_max')));
+
+// Create a binary "true" logging mask (this simulates actual disturbed patches)
+var loggingMask = loggingProb.gte(0.65).rename('logged'); // threshold can be tuned
+
+// Visualize base layers
+Map.addLayer(base.select('band2'), {min:0, max:1}, 'Synthetic band2 (vis)');
+Map.addLayer(ndvi, {min:0, max:1, palette:['brown','yellow','green']}, 'Synthetic NDVI');
+Map.addLayer(loggingMask.updateMask(loggingMask), {palette:['red']}, 'Synthetic True Logged Areas');
+
+// ---------------- Generate synthetic labeled points (>100) ----------------
+// Use ee.FeatureCollection.randomPoints and sample logging mask and predictors
+var randomPoints = ee.FeatureCollection.randomPoints({
+  region: AOI,
+  points: NUM_POINTS,
+  seed: RANDOM_SEED
+}).map(function(f){ return f.set('pt_id', ee.Number(f.id())); });
+
+// Sample predictors and the true label at points
+var predictors = base.addBands(ndvi).addBands(texture).addBands(loggingProb);
+
+// Sample at the point locations: include geometry
+var sampled = predictors.sampleRegions({
+  collection: randomPoints,
+  properties: ['pt_id'],
+  scale: EXPORT_SCALE,
+  geometries: true
+});
+
+// Derive binary label 'is_logged' from the true logging mask by sampling it too
+var sampledWithLabel = sampled.map(function(f){
+  var p = ee.Feature(f);
+  var geom = p.geometry();
+  var label = loggingMask.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: geom,
+    scale: EXPORT_SCALE,
+    maxPixels: 1e9
+  }).get('logged');
+  // if label is null (edge cases), treat as 0
+  label = ee.Algorithms.If(ee.Algorithms.IsEqual(label, null), 0, label);
+  return p.set('is_logged', ee.Number(label).toInt());
+});
+
+// Quick checks
+print('Total sampled points:', sampledWithLabel.size());
+print('Sampled example points:', sampledWithLabel.limit(10));
+print('Class distribution (0=not-logged,1=logged):', sampledWithLabel.aggregate_histogram('is_logged'));
+
+// ---------------- Train/test split ----------------
+sampledWithLabel = sampledWithLabel.randomColumn('rnd', RANDOM_SEED);
+var training = sampledWithLabel.filter(ee.Filter.lt('rnd', TRAIN_RATIO));
+var testing = sampledWithLabel.filter(ee.Filter.gte('rnd', TRAIN_RATIO));
+
+print('Training count:', training.size());
+print('Testing count:', testing.size());
+
+// ---------------- Train Random Forest classifier ----------------
+var featureList = ['band1','band2','band3','ndvi','texture','loggingProb'];
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: RF_TREES,
+  seed: RANDOM_SEED
+}).train({
+  features: training,
+  classProperty: 'is_logged',
+  inputProperties: featureList
+});
+
+// Apply classifier to predictors
+var classified = predictors.select(featureList).classify(classifier).rename('pred_logged').clip(AOI);
+
+// ---------------- Evaluate ----------------
+// Classify testing points
+var testClassified = testing.classify(classifier);
+
+// Confusion matrix and accuracy
+var confMatrix = testClassified.errorMatrix('is_logged', 'classification');
+print('Confusion Matrix:', confMatrix);
+print('Overall accuracy:', confMatrix.accuracy());
+print('Kappa:', confMatrix.kappa());
+print('Producer accuracy (logged):', confMatrix.producersAccuracy(1));
+print('User accuracy (logged):', confMatrix.consumersAccuracy(1));
+
+// ---------------- Visualization ----------------
+Map.addLayer(classified.updateMask(classified), {min:0, max:1, palette:['white','red']}, 'Predicted Logged Areas');
+Map.addLayer(predictors.select('loggingProb'), {min:0, max:1, palette:['white','purple']}, 'Logging Probability (synthetic)');
+Map.addLayer(sampledWithLabel.filter(ee.Filter.eq('is_logged', 1)).style({color:'red'}), {}, 'Sampled - Logged (true)');
+Map.addLayer(sampledWithLabel.filter(ee.Filter.eq('is_logged', 0)).style({color:'blue'}), {}, 'Sampled - Not Logged (true)');
+
+// ---------------- Optional: Export sampled labeled points to Drive (CSV) ----------------
+// Uncomment to export the labeled points for offline analysis
+/*
+Export.table.toDrive({
+  collection: sampledWithLabel.select(['pt_id','band1','band2','band3','ndvi','texture','loggingProb','is_logged']),
+  description: 'synthetic_logging_points',
+  folder: 'GEE-Exports',
+  fileFormat: 'CSV'
+});
+*/
+
+// ---------------- Optional: Export classified raster to Drive ----------------
+// Uncomment to export the prediction raster (GeoTIFF)
+/*
+Export.image.toDrive({
+  image: classified.toByte(),
+  description: 'synthetic_logged_prediction',
+  folder: 'GEE-Exports',
+  scale: EXPORT_SCALE,
+  region: AOI,
+  maxPixels: 1e13
+});
+*/
+
+// ---------------- Summary ----------------
+print('--- Summary ---');
+print('AOI bounds:', AOI.bounds());
+print('NUM_POINTS:', NUM_POINTS);
+print('RF trees:', RF_TREES);
+print('Training ratio:', TRAIN_RATIO);
+print('Note: Replace synthetic layers with real satellite bands (e.g., Sentinel-2) for operational use.');
